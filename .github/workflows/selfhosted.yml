@@ -556,7 +556,7 @@ jobs:
           -d parse_mode="Markdown"
         }
 
-        send_telegram_message "Crave Project: ${{ github.event.inputs.BASE_PROJECT }}%0ACrave ProjectID: $PROJECTID %0ABuild for ${{ github.event.inputs.DEVICE_NAME }} has Succeeded! %0ACheck Progress at: %0Ahttps://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/actions/runs/${{ github.run_id }}%0ADownload at: https://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/releases/tag/${{ github.run_id }}"
+        send_telegram_message "Crave Project: ${{ github.event.inputs.BASE_PROJECT }}%0ACrave ProjectID: $PROJECTID %0ABuild for ${{ github.event.inputs.DEVICE_NAME }} has Succeeded!%0AUploading artifacts and mirrors now...%0ACheck Progress at: %0Ahttps://github.com/$(echo "${{ github.repository }}" | sed 's@_@\\_@g')/actions/runs/${{ github.run_id }}"
 
       env:
         chatId: ${{ secrets.TELEGRAM_TO }}
@@ -606,6 +606,401 @@ jobs:
         echo "${{ secrets.GITHUB_TOKEN }}" > token.txt
         crave push token.txt -d $(crave ssh -- pwd | grep -v Select | sed -s 's/\r//g')/
         crave ssh -- "export GH_UPLOAD_LIMIT="${{ secrets.GH_UPLOAD_LIMIT }}"; bash /opt/crave/github-actions/upload.sh '${{ github.run_id }}' '${{ github.event.inputs.DEVICE_NAME }}'  '${{ github.repository }}' '${{ github.event.inputs.PRODUCT_NAME }}-${{ github.run_id }}' '${{ secrets.EXTRA_FILES }}'"
+
+      # Upload build artifact mirror(s) to external hosts and send final Telegram buttons.
+    - name: Upload build mirror(s)
+      if: ${{ success() }}
+      continue-on-error: true
+      run: |
+        set +x
+        cd $PROJECTFOLDER
+
+        REMOTE_DIR="$(crave ssh -- pwd | grep -v Select | sed -s 's/\r//g')"
+
+        cat > mirror-upload.env <<'EOF'
+        export TELEGRAM_TO='${{ secrets.TELEGRAM_TO }}'
+        export TELEGRAM_TOKEN='${{ secrets.TELEGRAM_TOKEN }}'
+        export GOFILE_TOKEN='${{ secrets.GOFILE_TOKEN }}'
+        export GOFILE_FOLDER_ID='${{ secrets.GOFILE_FOLDER_ID }}'
+        export PIXELDRAIN_API_KEY='${{ secrets.PIXELDRAIN_API_KEY }}'
+        export PIXELDRAIN_TOKEN='${{ secrets.PIXELDRAIN_TOKEN }}'
+        export VIKINGFILE_USER_HASH='${{ secrets.VIKINGFILE_USER_HASH }}'
+        export VIKINGFILE_HASH='${{ secrets.VIKINGFILE_HASH }}'
+        export VIKINGFILE_PATH='${{ secrets.VIKINGFILE_PATH }}'
+        export VIKINGFILE_PUBLIC_SHARE='${{ secrets.VIKINGFILE_PUBLIC_SHARE }}'
+        export MIRROR_ARTIFACT_LIMIT='${{ secrets.MIRROR_ARTIFACT_LIMIT }}'
+        EOF
+        sed -i 's/^        //' mirror-upload.env
+        chmod 600 mirror-upload.env
+
+        cat > mirror-upload.sh <<'EOF'
+        #!/usr/bin/env bash
+        set -uo pipefail
+
+        DEVICE_NAME="${1:?device name required}"
+        REPOSITORY="${2:?repository required}"
+        RUN_ID="${3:?run id required}"
+
+        export TZ="${TZ:-Asia/Jakarta}"
+        PIXELDRAIN_API_KEY="${PIXELDRAIN_API_KEY:-${PIXELDRAIN_TOKEN:-}}"
+        VIKINGFILE_USER_HASH="${VIKINGFILE_USER_HASH:-${VIKINGFILE_HASH:-}}"
+        MIRROR_ARTIFACT_LIMIT="${MIRROR_ARTIFACT_LIMIT:-1}"
+
+        log() { printf '[mirror-upload] %s\n' "$*" >&2; }
+
+        json_get() {
+          local file="$1" expr="$2"
+          python3 - "$file" "$expr" <<'PY'
+        import json, sys
+        path, expr = sys.argv[1], sys.argv[2]
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                obj = json.load(fh)
+            cur = obj
+            for part in expr.split('.'):
+                if not part:
+                    continue
+                if isinstance(cur, list):
+                    cur = cur[int(part)]
+                else:
+                    cur = cur[part]
+            if cur is None:
+                sys.exit(1)
+            if isinstance(cur, (dict, list)):
+                print(json.dumps(cur, separators=(',', ':')))
+            else:
+                print(cur)
+        except Exception:
+            sys.exit(1)
+        PY
+        }
+
+        json_first() {
+          local file="$1"; shift
+          local expr value
+          for expr in "$@"; do
+            value="$(json_get "$file" "$expr" 2>/dev/null || true)"
+            if [[ -n "$value" && "$value" != "null" ]]; then
+              printf '%s\n' "$value"
+              return 0
+            fi
+          done
+          return 1
+        }
+
+        url_encode() {
+          python3 - "$1" <<'PY'
+        import sys, urllib.parse
+        print(urllib.parse.quote(sys.argv[1], safe=''))
+        PY
+        }
+
+        record_result() {
+          local outdir="$1" service="$2" status="$3" value="$4"
+          printf '%s\n%s\n' "$status" "$value" > "$outdir/${service}.result"
+        }
+
+        upload_pixeldrain() {
+          local file="$1" outdir="$2" base encoded tmp err id
+          base="$(basename "$file")"
+          if [[ -z "${PIXELDRAIN_API_KEY:-}" ]]; then
+            record_result "$outdir" pixeldrain skipped "PIXELDRAIN_API_KEY/PIXELDRAIN_TOKEN is not set"
+            return 0
+          fi
+          encoded="$(url_encode "$base")"
+          tmp="$(mktemp)"; err="$(mktemp)"
+          if ! curl -fsS --retry 2 --retry-delay 5 -T "$file" -u ":$PIXELDRAIN_API_KEY" \
+              "https://pixeldrain.com/api/file/$encoded" -o "$tmp" 2>"$err"; then
+            record_result "$outdir" pixeldrain failed "$(tr '\n' ' ' < "$err" | cut -c1-300)"
+            return 0
+          fi
+          id="$(json_first "$tmp" id data.id 2>/dev/null || true)"
+          if [[ -z "$id" ]]; then
+            record_result "$outdir" pixeldrain failed "No file id in response: $(tr '\n' ' ' < "$tmp" | cut -c1-300)"
+            return 0
+          fi
+          record_result "$outdir" pixeldrain ok "https://pixeldrain.com/u/$id"
+        }
+
+        upload_gofile() {
+          local file="$1" outdir="$2" tmp err status url code
+          tmp="$(mktemp)"; err="$(mktemp)"
+          local args=(curl -fsS --retry 2 --retry-delay 5 -X POST "https://upload.gofile.io/uploadfile" -F "file=@${file}")
+          if [[ -n "${GOFILE_TOKEN:-}" ]]; then
+            args+=(-H "Authorization: Bearer ${GOFILE_TOKEN}")
+          fi
+          if [[ -n "${GOFILE_FOLDER_ID:-}" ]]; then
+            args+=(-F "folderId=${GOFILE_FOLDER_ID}")
+          fi
+          if ! "${args[@]}" -o "$tmp" 2>"$err"; then
+            record_result "$outdir" gofile failed "$(tr '\n' ' ' < "$err" | cut -c1-300)"
+            return 0
+          fi
+          status="$(json_first "$tmp" status 2>/dev/null || true)"
+          if [[ "$status" != "ok" ]]; then
+            record_result "$outdir" gofile failed "Unexpected response: $(tr '\n' ' ' < "$tmp" | cut -c1-300)"
+            return 0
+          fi
+          url="$(json_first "$tmp" data.downloadPage data.downloadPageUrl data.link data.url data.directLink 2>/dev/null || true)"
+          if [[ -z "$url" ]]; then
+            code="$(json_first "$tmp" data.code data.fileId data.folderId 2>/dev/null || true)"
+            [[ -n "$code" ]] && url="https://gofile.io/d/$code"
+          fi
+          if [[ -z "$url" ]]; then
+            record_result "$outdir" gofile failed "No public URL in response: $(tr '\n' ' ' < "$tmp" | cut -c1-300)"
+            return 0
+          fi
+          record_result "$outdir" gofile ok "$url"
+        }
+
+        upload_vikingfile() {
+          local file="$1" outdir="$2" base size tmp err upload_id key part_size number_parts idx url offset len hdr etag complete
+          base="$(basename "$file")"
+          size="$(stat -c '%s' "$file")"
+          tmp="$(mktemp)"; err="$(mktemp)"
+
+          if ! curl -fsS --retry 2 --retry-delay 5 -X POST "https://vikingfile.com/api/get-upload-url" \
+              --data-urlencode "size=$size" -o "$tmp" 2>"$err"; then
+            record_result "$outdir" vikingfile failed "$(tr '\n' ' ' < "$err" | cut -c1-300)"
+            return 0
+          fi
+
+          upload_id="$(json_first "$tmp" uploadId 2>/dev/null || true)"
+          key="$(json_first "$tmp" key 2>/dev/null || true)"
+          part_size="$(json_first "$tmp" partSize 2>/dev/null || true)"
+          number_parts="$(json_first "$tmp" numberParts 2>/dev/null || true)"
+          if [[ -z "$upload_id" || -z "$key" || -z "$part_size" || -z "$number_parts" ]]; then
+            record_result "$outdir" vikingfile failed "Invalid get-upload-url response: $(tr '\n' ' ' < "$tmp" | cut -c1-300)"
+            return 0
+          fi
+
+          local -a complete_args
+          complete_args=(curl -fsS --retry 2 --retry-delay 5 -X POST "https://vikingfile.com/api/complete-upload"
+            --data-urlencode "key=$key"
+            --data-urlencode "uploadId=$upload_id"
+            --data-urlencode "name=$base"
+            --data-urlencode "user=${VIKINGFILE_USER_HASH:-}")
+          [[ -n "${VIKINGFILE_PATH:-}" ]] && complete_args+=(--data-urlencode "path=${VIKINGFILE_PATH}")
+          [[ -n "${VIKINGFILE_PUBLIC_SHARE:-}" ]] && complete_args+=(--data-urlencode "pathPublicShare=${VIKINGFILE_PUBLIC_SHARE}")
+
+          for ((idx=0; idx<number_parts; idx++)); do
+            url="$(json_get "$tmp" "urls.$idx" 2>/dev/null || true)"
+            if [[ -z "$url" ]]; then
+              record_result "$outdir" vikingfile failed "Missing upload URL for part $((idx + 1))"
+              return 0
+            fi
+            offset=$((idx * part_size))
+            len="$part_size"
+            if (( offset + len > size )); then
+              len=$((size - offset))
+            fi
+            hdr="$(mktemp)"; err="$(mktemp)"
+            if ! dd if="$file" bs=1M skip="$offset" count="$len" iflag=skip_bytes,count_bytes status=none \
+                | curl -fsS --retry 2 --retry-delay 5 -X PUT --data-binary @- -D "$hdr" "$url" -o /dev/null 2>"$err"; then
+              record_result "$outdir" vikingfile failed "Part $((idx + 1)) failed: $(tr '\n' ' ' < "$err" | cut -c1-300)"
+              return 0
+            fi
+            etag="$(awk 'BEGIN{IGNORECASE=1} /^etag:/ {gsub("\r", ""); sub(/^[Ee][Tt][Aa][Gg]:[[:space:]]*/, ""); gsub(/\"/, ""); print; exit}' "$hdr")"
+            if [[ -z "$etag" ]]; then
+              record_result "$outdir" vikingfile failed "No ETag returned for part $((idx + 1))"
+              return 0
+            fi
+            complete_args+=(--data-urlencode "parts[$idx][PartNumber]=$((idx + 1))")
+            complete_args+=(--data-urlencode "parts[$idx][ETag]=$etag")
+          done
+
+          complete="$(mktemp)"; err="$(mktemp)"
+          if ! "${complete_args[@]}" -o "$complete" 2>"$err"; then
+            record_result "$outdir" vikingfile failed "$(tr '\n' ' ' < "$err" | cut -c1-300)"
+            return 0
+          fi
+          url="$(json_first "$complete" url 2>/dev/null || true)"
+          if [[ -z "$url" ]]; then
+            record_result "$outdir" vikingfile failed "No public URL in response: $(tr '\n' ' ' < "$complete" | cut -c1-300)"
+            return 0
+          fi
+          record_result "$outdir" vikingfile ok "$url"
+        }
+
+        find_artifacts() {
+          python3 - "$DEVICE_NAME" "$MIRROR_ARTIFACT_LIMIT" <<'PY'
+        import sys
+        from pathlib import Path
+        device = sys.argv[1]
+        try:
+            limit = max(1, int(sys.argv[2] or '1'))
+        except Exception:
+            limit = 1
+        roots = [Path('out/target/product') / device, Path('out')]
+        files = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for pattern in ('*.zip', '*.img'):
+                for p in root.rglob(pattern):
+                    if not p.is_file():
+                        continue
+                    path = str(p)
+                    if '/obj/' in path or '/intermediates/' in path:
+                        continue
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    score = 0 if p.suffix == '.zip' else 1
+                    files.append((score, -st.st_mtime, path))
+            if files:
+                break
+        seen = set()
+        selected = []
+        for _, _, path in sorted(files):
+            if path not in seen:
+                seen.add(path)
+                selected.append(path)
+            if len(selected) >= limit:
+                break
+        for path in selected:
+            print(path)
+        PY
+        }
+
+        send_telegram_upload_complete() {
+          local file="$1" outdir="$2"
+          if [[ -z "${TELEGRAM_TOKEN:-}" || -z "${TELEGRAM_TO:-}" ]]; then
+            log "Telegram secrets are not set; skipping upload-complete message."
+            return 0
+          fi
+
+          python3 - "$file" "$outdir" "$TELEGRAM_TO" <<'PY' > "$outdir/telegram_payload.json"
+        import datetime as dt
+        import hashlib
+        import html
+        import json
+        import mimetypes
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        file_path = Path(sys.argv[1])
+        outdir = Path(sys.argv[2])
+        chat_id = sys.argv[3]
+
+        services = [
+            ("pixeldrain", "Pixeldrain"),
+            ("gofile", "GoFile"),
+            ("vikingfile", "Vikingfile"),
+        ]
+
+        def read_result(slug):
+            result = outdir / f"{slug}.result"
+            if not result.exists():
+                return "failed", "No result produced"
+            lines = result.read_text(errors="replace").splitlines()
+            status = lines[0] if lines else "failed"
+            value = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+            return status, value
+
+        def sha256sum(path):
+            h = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        size = file_path.stat().st_size
+        size_human = f"{size / 1000**3:.2f} GB" if size >= 1000**3 else (
+            f"{size / 1000**2:.2f} MB" if size >= 1000**2 else f"{size} bytes"
+        )
+        mime = mimetypes.guess_type(str(file_path))[0]
+        if not mime:
+            try:
+                mime = subprocess.check_output(["file", "--mime-type", "-b", str(file_path)], text=True).strip()
+            except Exception:
+                mime = "application/octet-stream"
+        uploaded = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S WIB (UTC+7)")
+        digest = sha256sum(file_path)
+
+        statuses = []
+        buttons = []
+        for slug, label in services:
+            status, value = read_result(slug)
+            if status == "ok" and value.startswith("http"):
+                statuses.append(f"{label}: OK")
+                buttons.append([{"text": f"⬇️ {label}", "url": value}])
+            elif status == "skipped":
+                statuses.append(f"{label}: SKIPPED - {value}")
+            else:
+                statuses.append(f"{label}: FAILED - {value}")
+
+        e = html.escape
+        meta = "\n".join([
+            f"File: {file_path.name}",
+            f"Type: {mime}",
+            f"Size: {size_human} ({size} bytes)",
+            f"SHA256: {digest}",
+            f"Uploaded: {uploaded}",
+        ])
+        message = (
+            "<b>✅ Upload Complete</b>\n\n"
+            f"<blockquote expandable>{e(meta)}</blockquote>\n\n"
+            f"<pre>{e(chr(10).join(statuses))}</pre>"
+        )
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": buttons}
+        print(json.dumps(payload, separators=(",", ":")))
+        PY
+
+          curl -fsS --retry 2 --retry-delay 5 \
+            -H "Content-Type: application/json" \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d "@$outdir/telegram_payload.json" >/dev/null || true
+        }
+
+        upload_artifact_to_mirrors() {
+          local file="$1" outdir pids=()
+          outdir="$(mktemp -d)"
+          log "Uploading $(basename "$file") to Pixeldrain, GoFile, and Vikingfile in parallel"
+
+          upload_pixeldrain "$file" "$outdir" & pids+=("$!")
+          upload_gofile "$file" "$outdir" & pids+=("$!")
+          upload_vikingfile "$file" "$outdir" & pids+=("$!")
+
+          local pid
+          for pid in "${pids[@]}"; do
+            wait "$pid" || true
+          done
+
+          log "Upload results for $(basename "$file"):"
+          for result in "$outdir"/*.result; do
+            [[ -e "$result" ]] || continue
+            printf '%s: ' "$(basename "$result" .result)" >&2
+            paste -sd ' | ' "$result" >&2 || true
+          done
+          send_telegram_upload_complete "$file" "$outdir"
+        }
+
+        mapfile -t ARTIFACTS < <(find_artifacts)
+        if (( ${#ARTIFACTS[@]} == 0 )); then
+          log "No .zip or .img artifacts found under out/target/product/$DEVICE_NAME or out/."
+          exit 0
+        fi
+
+        for artifact in "${ARTIFACTS[@]}"; do
+          upload_artifact_to_mirrors "$artifact"
+        done
+        EOF
+        sed -i 's/^        //' mirror-upload.sh
+        chmod +x mirror-upload.sh
+
+        crave push mirror-upload.env -d "$REMOTE_DIR/"
+        crave push mirror-upload.sh -d "$REMOTE_DIR/"
+        crave ssh -- "set +x; . ./mirror-upload.env; bash ./mirror-upload.sh '${{ github.event.inputs.DEVICE_NAME }}' '${{ github.repository }}' '${{ github.run_id }}'"
 
       # Pull Errors and Display them
     - name: Display error.log
