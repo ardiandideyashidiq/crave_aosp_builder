@@ -128,6 +128,14 @@ Custom Upload limit for telegram-upload. Default is 2147483648
 Custom Upload limit for github releases. Default is 2147483648
 ### DISPLAY_FALSE (Optional)
 This workflow displays your local manifests by default. To disable this, create this secret with any data
+## Optional upload token
+PIXELDRAIN_API_KEY      # or PIXELDRAIN_TOKEN
+VIKINGFILE_USER_HASH    # or VIKINGFILE_HASH
+GOFILE_TOKEN            # optional
+GOFILE_FOLDER_ID        # optional
+VIKINGFILE_PATH         # optional
+VIKINGFILE_PUBLIC_SHARE # optional
+MIRROR_ARTIFACT_LIMIT   # optional, default 1
 
 ## Inputs Explanation
 ### Base Project
